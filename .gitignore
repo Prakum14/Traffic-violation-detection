@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Model files (large files)
+*.pt
+*.pth
+*.weights
+*.onnx
+
+# Video files (large files - don't upload to GitHub)
+*.mp4
+*.avi
+*.mov
+*.mkv
+input_videos/
+
+# Violation snapshots (output files)
+violations/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# API keys (IMPORTANT - keep your API key safe!)
+config.py
+secrets.py
+.env
