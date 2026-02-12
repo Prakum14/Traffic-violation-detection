@@ -13,8 +13,8 @@ local_model = YOLO('yolov8n.pt')
 # You can add as many points as needed to follow the curve
 # Points should go from top to bottom of the frame
 # 
-# IMPORTANT: Wrong-way detection uses the BOTTOM of the bike (where it touches the road)
-# not the center or top (helmet). This ensures accurate side detection.
+# IMPORTANT: Wrong-way detection uses 70% down the bike (stable tracking point)
+# not the center or bottom edge. This prevents false positives from body parts crossing.
 DIVIDER_POINTS = [
     (1238, 33),  # Point 1
     (1177, 59),  # Point 2
@@ -39,12 +39,16 @@ REFERENCE_DIRECTION = "UP"      # Which way does traffic flow on that side?
 
 # Detection sensitivity
 MOVEMENT_THRESHOLD = 12
-MIN_TRACK_FRAMES = 12
+MIN_TRACK_FRAMES = 5
 DIRECTION_HISTORY_SIZE = 25
+DIVIDER_BUFFER_ZONE = 50  # Pixels - bikes within this distance to divider are not flagged
 
-# Helmet detection sensitivity
-HELMET_CONFIDENCE_THRESHOLD = 0.25  # Lower = more sensitive (may have false positives)
+# Helmet detection sensitivity - STRICTER now
+HELMET_CONFIDENCE_THRESHOLD = 0.38  # Increased to reject cloth/caps
 HELMET_REGION_MULTIPLIER = 0.8      # How far above bike to look for helmet
+
+# Tracking point adjustment
+BIKE_TRACKING_PERCENTAGE = 0.40  # 40% down the bounding box (adjust if needed: 0.65, 0.75)
 
 # Create violation folders
 os.makedirs('violations/no_helmet', exist_ok=True)
@@ -65,12 +69,14 @@ frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 fps = int(cap.get(cv2.CAP_PROP_FPS))
 
 print("="*70)
-print("TRAFFIC VIOLATION DETECTION SYSTEM - REFINED")
+print("TRAFFIC VIOLATION DETECTION SYSTEM - FINAL VERSION")
 print("="*70)
 print(f"Video Resolution: {frame_width}x{frame_height}")
 print(f"FPS: {fps}")
 print(f"Divider Points: {len(DIVIDER_POINTS)} points")
 print(f"Reference: {REFERENCE_SIDE} side goes {REFERENCE_DIRECTION}")
+print(f"Buffer Zone: {DIVIDER_BUFFER_ZONE} pixels")
+print(f"Helmet Threshold: {HELMET_CONFIDENCE_THRESHOLD}")
 print("="*70)
 print("Controls:")
 print("  'q' - Quit")
@@ -83,6 +89,8 @@ debug_mode = False
 paused = False
 mouse_x, mouse_y = 0, 0
 
+##################################################################################################################################
+# ALL FUNCTION DEFINITIONS MUST BE HERE (BEFORE MAIN LOOP)
 ##################################################################################################################################
 
 def interpolate_curve(points, num_interpolated=100):
@@ -133,6 +141,20 @@ def get_side_of_curve(point, curve_points):
             side = "LEFT" if cross_product > 0 else "RIGHT"
     
     return side
+
+def get_distance_to_curve(point, curve_points):
+    """
+    Calculate minimum distance from point to curve.
+    Used for buffer zone detection.
+    """
+    px, py = point
+    min_distance = float('inf')
+    
+    for curve_point in curve_points:
+        dist = np.sqrt((px - curve_point[0])**2 + (py - curve_point[1])**2)
+        min_distance = min(min_distance, dist)
+    
+    return min_distance
 
 def get_opposite_direction(direction):
     """Get opposite direction."""
@@ -204,18 +226,18 @@ def check_direction_violation(track_id, current_pos, side):
 
 def detect_helmet_improved(frame, box):
     """
-    Improved helmet detection - detects ANY type of helmet including half-face.
-    Focus: If there's ANY helmet-like object on head, mark as has_helmet.
+    STRICT helmet detection - only accepts HARD helmets, rejects cloth/caps.
+    Looks for: glossy surface, solid structure, helmet-specific colors.
     Returns: (has_helmet, confidence)
     """
     x1, y1, x2, y2 = box
     bike_h = y2 - y1
     bike_w = x2 - x1
     
-    # Define head/rider region - LARGER area to catch half helmets
+    # Define head region
     head_y1 = max(0, int(y1 - bike_h * HELMET_REGION_MULTIPLIER))
-    head_y2 = int(y1 + bike_h * 0.4)  # Increased from 0.3
-    head_x1 = max(0, int(x1 - bike_w * 0.3))  # Increased margin
+    head_y2 = int(y1 + bike_h * 0.4)
+    head_x1 = max(0, int(x1 - bike_w * 0.3))
     head_x2 = min(frame.shape[1], int(x2 + bike_w * 0.3))
     
     head_region = frame[head_y1:head_y2, head_x1:head_x2]
@@ -223,112 +245,107 @@ def detect_helmet_improved(frame, box):
     if head_region.size == 0:
         return False, 0.0
     
-    # Convert to color spaces
     hsv = cv2.cvtColor(head_region, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(head_region, cv2.COLOR_BGR2GRAY)
     
-    # Method 1: EXPANDED color detection (catches more helmet types)
+    # Method 1: STRICT color detection - ONLY bright/saturated helmet colors
+    # Excludes dull cloth colors
     masks = []
     
-    # Red helmets (broader range, lower saturation threshold)
-    masks.append(cv2.inRange(hsv, np.array([0, 40, 40]), np.array([15, 255, 255])))
-    masks.append(cv2.inRange(hsv, np.array([165, 40, 40]), np.array([180, 255, 255])))
+    # Bright Red helmets (HIGH saturation only - no dull red cloth)
+    masks.append(cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255])))
+    masks.append(cv2.inRange(hsv, np.array([170, 100, 100]), np.array([180, 255, 255])))
     
-    # Yellow/Orange helmets
-    masks.append(cv2.inRange(hsv, np.array([15, 40, 40]), np.array([40, 255, 255])))
+    # Bright Yellow/Orange helmets (HIGH saturation - no beige/tan cloth)
+    masks.append(cv2.inRange(hsv, np.array([20, 100, 120]), np.array([35, 255, 255])))
     
-    # White helmets (broader range)
-    masks.append(cv2.inRange(hsv, np.array([0, 0, 150]), np.array([180, 60, 255])))
+    # GLOSSY White helmets (VERY bright, low saturation - not dull white cloth)
+    masks.append(cv2.inRange(hsv, np.array([0, 0, 200]), np.array([180, 35, 255])))
     
-    # Black helmets (broader range)
-    masks.append(cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 90])))
+    # GLOSSY Black helmets (VERY dark, very low saturation - not black cloth)
+    masks.append(cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 30, 60])))
     
-    # Blue helmets
-    masks.append(cv2.inRange(hsv, np.array([90, 40, 40]), np.array([135, 255, 255])))
+    # Bright Blue helmets (HIGH saturation only)
+    masks.append(cv2.inRange(hsv, np.array([100, 100, 100]), np.array([130, 255, 255])))
     
-    # Green helmets
-    masks.append(cv2.inRange(hsv, np.array([40, 40, 40]), np.array([85, 255, 255])))
+    # Bright Green helmets (HIGH saturation only)
+    masks.append(cv2.inRange(hsv, np.array([45, 100, 100]), np.array([75, 255, 255])))
     
-    # Gray/Silver helmets (common for half-face)
-    masks.append(cv2.inRange(hsv, np.array([0, 0, 90]), np.array([180, 60, 200])))
-    
-    # Brown/Tan (some half helmets)
-    masks.append(cv2.inRange(hsv, np.array([5, 30, 30]), np.array([25, 200, 200])))
-    
-    # Combine all color masks
     combined_mask = np.zeros_like(masks[0])
     for mask in masks:
         combined_mask = cv2.bitwise_or(combined_mask, mask)
     
-    # Method 2: Edge detection - look for ANY curved edge at top of region
+    # Method 2: DETECT GLOSSY/REFLECTIVE SURFACE (helmets reflect light, cloth doesn't)
+    # Look for high-intensity spots (specular reflections)
+    _, bright_spots = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+    bright_ratio = np.sum(bright_spots > 0) / (gray.shape[0] * gray.shape[1])
+    has_gloss = bright_ratio > 0.01  # At least 1% bright reflective pixels
+    
+    # Method 3: TEXTURE ANALYSIS (helmets are smooth, cloth is textured)
+    # Calculate local standard deviation
+    kernel_size = 5
+    mean_filtered = cv2.blur(gray.astype(float), (kernel_size, kernel_size))
+    sqr_mean_filtered = cv2.blur((gray.astype(float))**2, (kernel_size, kernel_size))
+    variance = sqr_mean_filtered - mean_filtered**2
+    variance = np.maximum(variance, 0)  # Ensure non-negative
+    std_dev = np.sqrt(variance)
+    
+    # Helmets have LOW texture variance (smooth), cloth has HIGH variance
+    avg_texture = np.mean(std_dev)
+    is_smooth = avg_texture < 20  # Smooth surface threshold
+    
+    # Method 4: SHAPE - Look for ROUNDED/DOME shape (helmet characteristic)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 30, 100)  # Lower threshold to catch more
+    edges = cv2.Canny(blurred, 40, 120)
     
-    # Check top portion specifically (where helmet would be)
-    top_third = edges[:edges.shape[0]//3, :]
-    top_edge_density = np.sum(top_third > 0) / (top_third.shape[0] * top_third.shape[1])
-    has_top_edge = top_edge_density > 0.05  # Any reasonable edge density
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Method 3: Look for ANY solid object in upper region
-    # Apply threshold to find solid regions
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # Find contours of solid regions
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    has_solid_object = False
-    largest_area = 0
+    has_dome_shape = False
+    max_roundness = 0
     
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area > largest_area:
-            largest_area = area
-        if area > 100:  # Any reasonable sized object
-            # Check if it's in upper portion of region
-            M = cv2.moments(contour)
-            if M["m00"] > 0:
-                cy = int(M["m01"] / M["m00"])
-                if cy < head_region.shape[0] * 0.6:  # In upper 60%
-                    has_solid_object = True
+        if area > 200:  # Minimum helmet size
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter > 0:
+                # Circularity: 1.0 = perfect circle, helmets are ~0.6-0.9
+                circularity = 4 * np.pi * area / (perimeter * perimeter)
+                max_roundness = max(max_roundness, circularity)
+                if circularity > 0.55:  # Helmet-like roundness
+                    # Also check if it's in upper portion
+                    M = cv2.moments(contour)
+                    if M["m00"] > 0:
+                        cy = int(M["m01"] / M["m00"])
+                        if cy < head_region.shape[0] * 0.5:  # Top half
+                            has_dome_shape = True
     
-    # Method 4: Brightness difference (helmet vs hair/skin)
-    # Split region into top and bottom
-    mid_y = head_region.shape[0] // 2
-    top_half = gray[:mid_y, :]
-    bottom_half = gray[mid_y:, :]
-    
-    top_brightness = np.mean(top_half) if top_half.size > 0 else 0
-    bottom_brightness = np.mean(bottom_half) if bottom_half.size > 0 else 0
-    
-    # Helmets are often different brightness than face/hair
-    brightness_diff = abs(top_brightness - bottom_brightness)
-    has_brightness_contrast = brightness_diff > 15
-    
-    # Calculate scores
+    # Method 5: SIZE CHECK - Helmets have minimum size
     helmet_pixels = np.sum(combined_mask > 0)
     total_pixels = head_region.shape[0] * head_region.shape[1]
     color_ratio = helmet_pixels / total_pixels if total_pixels > 0 else 0
+    has_sufficient_size = helmet_pixels > 300  # Minimum pixels for a helmet
     
-    # Scoring (LENIENT for any helmet type)
-    color_score = min(1.0, color_ratio / 0.15)  # Only need 15% color match
-    edge_score = 1.0 if has_top_edge else 0.0
-    object_score = min(1.0, largest_area / 500.0) if has_solid_object else 0.0
-    contrast_score = 1.0 if has_brightness_contrast else 0.3
+    # Calculate individual scores
+    color_score = min(1.0, color_ratio / 0.15) if has_sufficient_size else 0.0
+    gloss_score = 1.0 if has_gloss else 0.0
+    smooth_score = 1.0 if is_smooth else 0.0
+    shape_score = min(1.0, max_roundness / 0.6) if has_dome_shape else 0.0
     
-    # LENIENT combination - just need SOME evidence of helmet
+    # STRICT SCORING - Need MULTIPLE positive indicators
+    # Cloth/caps will fail because they lack gloss OR smooth surface
     final_confidence = (
-        color_score * 0.40 +
-        edge_score * 0.25 +
-        object_score * 0.25 +
-        contrast_score * 0.10
+        color_score * 0.30 +
+        gloss_score * 0.25 +    # IMPORTANT: Cloth has no gloss
+        smooth_score * 0.25 +   # IMPORTANT: Cloth is textured
+        shape_score * 0.20
     )
     
-    # LENIENT threshold - if ANY indicator suggests helmet, accept it
+    # STRICT REQUIREMENTS - Must satisfy multiple criteria
     has_helmet = (
-        final_confidence > HELMET_CONFIDENCE_THRESHOLD or
-        (color_score > 0.3) or  # Decent color match
-        (has_top_edge and color_score > 0.2) or  # Edge + some color
-        (has_solid_object and has_top_edge)  # Solid object with edges
+        final_confidence > HELMET_CONFIDENCE_THRESHOLD and
+        (gloss_score > 0.5 or smooth_score > 0.5) and  # Must be glossy OR smooth
+        (color_score > 0.3 or shape_score > 0.4) and   # Must have color OR shape
+        has_sufficient_size  # Must be big enough
     )
     
     return has_helmet, final_confidence
@@ -397,6 +414,8 @@ def mouse_callback(event, x, y, flags, param):
             print(f"{'Paused' if paused else 'Playing'}")
 
 ##################################################################################################################################
+# MAIN LOOP STARTS HERE
+##################################################################################################################################
 
 # Create interpolated curve for smooth divider
 smooth_curve = interpolate_curve(DIVIDER_POINTS, num_interpolated=200)
@@ -420,12 +439,41 @@ while cap.isOpened():
     for i in range(len(smooth_curve) - 1):
         cv2.line(display_frame, smooth_curve[i], smooth_curve[i + 1], (0, 255, 255), 3)
     
-    # Draw control points (optional, only in debug mode)
+    # Draw buffer zone (optional, only in debug mode)
     if debug_mode:
+        # Draw divider control points
         for i, point in enumerate(DIVIDER_POINTS):
             cv2.circle(display_frame, point, 8, (0, 0, 255), -1)
             cv2.putText(display_frame, f"P{i+1}", (point[0] + 10, point[1] - 10),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        
+        # Draw buffer zone as semi-transparent area
+        overlay = display_frame.copy()
+        for i in range(len(smooth_curve) - 1):
+            # Create buffer on both sides of divider
+            x1, y1 = smooth_curve[i]
+            x2, y2 = smooth_curve[i + 1]
+            
+            # Calculate perpendicular direction
+            dx = x2 - x1
+            dy = y2 - y1
+            length = np.sqrt(dx*dx + dy*dy)
+            if length > 0:
+                perp_dx = -dy / length * DIVIDER_BUFFER_ZONE
+                perp_dy = dx / length * DIVIDER_BUFFER_ZONE
+                
+                # Left side buffer
+                left1 = (int(x1 + perp_dx), int(y1 + perp_dy))
+                left2 = (int(x2 + perp_dx), int(y2 + perp_dy))
+                cv2.line(overlay, left1, left2, (100, 100, 0), 2)
+                
+                # Right side buffer
+                right1 = (int(x1 - perp_dx), int(y1 - perp_dy))
+                right2 = (int(x2 - perp_dx), int(y2 - perp_dy))
+                cv2.line(overlay, right1, right2, (100, 100, 0), 2)
+        
+        # Blend overlay
+        cv2.addWeighted(overlay, 0.3, display_frame, 0.7, 0, display_frame)
 
     # A. TRACK MOTORCYCLES
     results = local_model.track(frame, persist=True, classes=[3], verbose=False)[0]
@@ -438,11 +486,8 @@ while cap.isOpened():
             x1, y1, x2, y2 = box
             
             # Use LOWER-MIDDLE of bike for direction detection
-            # Not the very bottom (which might include wheels/body parts crossing)
-            # Not the center (which includes upper body/helmet)
-            # Use a point 75% down the bounding box
             bike_track_x = (x1 + x2) // 2
-            bike_track_y = int(y1 + (y2 - y1) * 0.75)  # 75% down from top
+            bike_track_y = int(y1 + (y2 - y1) * BIKE_TRACKING_PERCENTAGE)
             
             # Use center for display purposes only
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2 
@@ -450,11 +495,28 @@ while cap.isOpened():
             # Determine side using LOWER-MIDDLE of bike
             side = get_side_of_curve((bike_track_x, bike_track_y), smooth_curve)
             
-            # Check direction violation using this tracking point
-            direction_violation, detected_dir, expected_dir, dir_confidence = \
-                check_direction_violation(track_id, (bike_track_x, bike_track_y), side)
+            # OPTIONAL: Uncomment these lines if your sides are inverted
+            #if side == "LEFT":
+             #    side = "RIGHT"
+            #elif side == "RIGHT":
+             #    side = "LEFT"
+            
+            # Calculate distance to divider for buffer zone
+            distance_to_divider = get_distance_to_curve((bike_track_x, bike_track_y), smooth_curve)
+            is_near_divider = distance_to_divider < DIVIDER_BUFFER_ZONE
+            
+            # Check direction violation (skip if in buffer zone)
+            if not is_near_divider:
+                direction_violation, detected_dir, expected_dir, dir_confidence = \
+                    check_direction_violation(track_id, (bike_track_x, bike_track_y), side)
+            else:
+                # Skip violation check for bikes near divider
+                direction_violation = False
+                detected_dir = "BUFFER"
+                expected_dir = get_expected_direction(side)
+                dir_confidence = 0.0
 
-            # Improved helmet detection
+            # Strict helmet detection
             has_helmet, helmet_confidence = detect_helmet_improved(frame, box)
             is_no_helmet = not has_helmet
 
@@ -503,17 +565,19 @@ while cap.isOpened():
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             
             # Debug info
-            # Debug info
             if debug_mode:
                 # Show center point (for reference)
                 cv2.circle(display_frame, (cx, cy), 5, (255, 0, 255), -1)
                 
-                # Show TRACKING point (75% down - what we actually track)
-                cv2.circle(display_frame, (bike_track_x, bike_track_y), 8, (0, 255, 0), -1)
-                cv2.putText(display_frame, "TRACK", (bike_track_x + 10, bike_track_y - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+                # Show TRACKING point (what we actually track)
+                track_color = (255, 165, 0) if is_near_divider else (0, 255, 0)  # Orange if in buffer
+                cv2.circle(display_frame, (bike_track_x, bike_track_y), 8, track_color, -1)
                 
-                debug_text = f"ID:{track_id}|{side}|{detected_dir}|H:{helmet_confidence:.2f}"
+                track_label = "BUFFER" if is_near_divider else "TRACK"
+                cv2.putText(display_frame, track_label, (bike_track_x + 10, bike_track_y - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, track_color, 1)
+                
+                debug_text = f"ID:{track_id}|{side}|{detected_dir}|H:{helmet_confidence:.2f}|D:{int(distance_to_divider)}"
                 cv2.putText(display_frame, debug_text, (x1, y2 + 20), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
                 
@@ -524,9 +588,9 @@ while cap.isOpened():
                         cv2.line(display_frame, points[i], points[i + 1], (0, 255, 0), 2)
 
     # Dashboard
-    dashboard_h = 120
-    cv2.rectangle(display_frame, (10, 10), (380, dashboard_h), (0, 0, 0), -1)
-    cv2.rectangle(display_frame, (10, 10), (380, dashboard_h), (255, 255, 255), 2)
+    dashboard_h = 140
+    cv2.rectangle(display_frame, (10, 10), (400, dashboard_h), (0, 0, 0), -1)
+    cv2.rectangle(display_frame, (10, 10), (400, dashboard_h), (255, 255, 255), 2)
     
     y_offset = 30
     cv2.putText(display_frame, f"Frame: {frame_count}", (20, y_offset), 
@@ -543,6 +607,11 @@ while cap.isOpened():
     y_offset += 25
     cv2.putText(display_frame, f"Combined: {len(violation_ids['combined'])}", 
                (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 100, 255), 2)
+    
+    y_offset += 25
+    debug_status = "ON" if debug_mode else "OFF"
+    cv2.putText(display_frame, f"Debug: {debug_status} (press 'd')", 
+               (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
     # Draw pause/play button
     button_coords = draw_pause_button(display_frame, paused)
